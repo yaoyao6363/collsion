@@ -55,13 +55,17 @@ class BayesLSTM(nn.Module):
             nn.Linear(hidden_size, 1),
         )
 
-    def forward(self, seq_x: torch.Tensor) -> torch.Tensor:
+    def forward(self, seq_x: torch.Tensor, return_feat=False) -> torch.Tensor:
         """
         标准前向传播（单次采样）
-        输入:
+        
+        Args:
             seq_x: (B, T, C)  CDM 序列特征
-        输出:
-            pred: (B, 1)      对最终 log10(risk) 的预测
+            return_feat: 是否返回特征向量（用于 SupCR）
+        
+        Returns:
+            pred: (B, 1)  对最终 log10(risk) 的预测
+            feat: (B, hidden_size)  特征向量，仅当 return_feat=True 时返回
         """
         # LSTM 输出：out: (B, T, H), h_n: (num_layers, B, H)
         out, (h_n, c_n) = self.lstm(seq_x)
@@ -70,10 +74,14 @@ class BayesLSTM(nn.Module):
         # h_n 形状: (num_layers, B, H) -> 取最后一层: (B, H)
         h_last = h_n[-1]  # (B, hidden_size)
 
-        # FC 前再做一次 dropout
-        h_last = self.pre_fc_dropout(h_last)
+        # FC 前再做一次 dropout（这是特征向量）
+        feat = self.pre_fc_dropout(h_last)
 
-        pred = self.fc(h_last)  # (B, 1)
+        pred = self.fc(feat)  # (B, 1)
+        
+        # 根据参数返回
+        if return_feat:
+            return pred, feat
         return pred
 
     @torch.no_grad()

@@ -17,21 +17,29 @@ from models.cdea_regressor import CDEARegressor
 from utils.data_preprocessor import pre_data
 from utils.dataset import CreateDataset
 from utils.stoper import Stopper
+from utils.loss import calculate_lds_weights, WeightedMSELoss, RankLoss, SupConRegressionLoss
 
 
 class RegressionSequenceDataset(Dataset):
-    """封装后的时序数据集，返回 (seq, target)"""
+    """封装后的时序数据集，返回 (seq, target, weight)"""
 
-    def __init__(self, data: np.ndarray, targets: np.ndarray):
+    def __init__(self, data: np.ndarray, targets: np.ndarray, weights: np.ndarray = None):
         targets = targets.reshape(-1, 1).astype(np.float32)
         self.data = torch.tensor(data, dtype=torch.float32)
         self.targets = torch.tensor(targets, dtype=torch.float32)
+        
+        # 处理权重：如果没有传权重(如测试集)，则全部设为 1.0
+        if weights is None:
+            self.weights = torch.ones_like(self.targets)
+        else:
+            self.weights = torch.tensor(weights.reshape(-1, 1), dtype=torch.float32)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx], self.targets[idx]
+        # 返回三个值: data, target, weight
+        return self.data[idx], self.targets[idx], self.weights[idx]
 
 
 def compute_metrics(preds, targets, threshold=-6):
@@ -142,9 +150,23 @@ class Solver:
         print(f"Total trainable parameters: {total_params:,}, Size: {param_size_mb:.2f} MB")
 
         self.optimizer = Adam(self.model.parameters(), lr=self.args.lr, weight_decay=1e-4)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=3)
         self.stopper = Stopper(patience=self.args.patience, path=self.model_path + '/' + 'checkpoint.pth')
-        self.criterion = nn.MSELoss()
+        
+        # === [修改] 初始化新的 Loss 函数 ===
+        self.criterion_mse = WeightedMSELoss()  # 支持权重的 MSE
+        self.criterion_rank = RankLoss(margin=getattr(args, 'rank_margin', 0.0))
+        self.criterion_sup = SupConRegressionLoss(
+            temperature=getattr(args, 'sup_temp', 0.1),
+            sigma=getattr(args, 'sup_sigma', 2.0)
+        )
+        
+        # Loss 的权重系数
+        self.lambda_rank = getattr(args, 'lambda_rank', 0.0)
+        self.lambda_sup = getattr(args, 'lambda_sup', 0.0)
+        self.use_supcr = getattr(args, 'use_supcr', False)
+        
+        print(f"Loss configuration: lambda_rank={self.lambda_rank}, lambda_sup={self.lambda_sup}, use_supcr={self.use_supcr}")
 
     def _acquire_device(self):
         if self.args.use_gpu:
@@ -199,12 +221,24 @@ class Solver:
             train_x_r, train_y_r, test_size=split_ratio, random_state=self.args.seed, shuffle=True
         )
 
+        # === [新增] 计算训练集的 LDS 权重 ===
+        print("Calculating LDS weights for training data...")
+        train_weights_n = calculate_lds_weights(
+            y_train, 
+            n_bins=100, 
+            kernel='gaussian', 
+            ks=5, 
+            sigma=2
+        )
+        print(f"LDS weights calculated. Min: {train_weights_n.min():.3f}, Max: {train_weights_n.max():.3f}, Mean: {train_weights_n.mean():.3f}")
+
         x_train, normalized_others = self._normalize_sequences(x_train, [x_val, test_x_r])
         x_val, x_test = normalized_others
 
-        train_dataset = RegressionSequenceDataset(x_train, y_train)
-        val_dataset = RegressionSequenceDataset(x_val, y_val)
-        test_dataset = RegressionSequenceDataset(x_test, test_y_r)
+        # === [修改] 传入 weights ===
+        train_dataset = RegressionSequenceDataset(x_train, y_train, weights=train_weights_n)
+        val_dataset = RegressionSequenceDataset(x_val, y_val, weights=None)      # 验证集不加权
+        test_dataset = RegressionSequenceDataset(x_test, test_y_r, weights=None) # 测试集不加权
 
         train_loader = DataLoader(train_dataset, batch_size=self.args.batch_size, shuffle=True, drop_last=False)
         val_loader = DataLoader(val_dataset, batch_size=self.args.batch_size, shuffle=False, drop_last=False)
@@ -222,22 +256,45 @@ class Solver:
         self.feature_std = std
         return norm_train, normalized_others
 
-    def _process_batch(self, seq_x, seq_y):
+    def _process_batch(self, seq_x, seq_y, weights):
         seq_x = seq_x.float().to(self.device)
         seq_y = seq_y.float().to(self.device)
+        weights = weights.float().to(self.device)  # 移动权重到 GPU
 
+        # 获取预测值和特征 (SupCR 需要特征)
         if self.args.model == 'CDEA':
             # seq_x: (B, seq_len, feature_dim)
-            # 取最后一个时间步的特征作为“当前 TCA 前刻”的物理状态
+            # 取最后一个时间步的特征作为"当前 TCA 前刻"的物理状态
             last_step = seq_x[:, -1, :]                          # (B, feature_dim)
             phys_feat = last_step[:, self.phys_feat_indices]     # (B, P)
 
-            pred = self.model(seq_x, phys_feat=phys_feat)
+            if self.use_supcr:
+                pred, features = self.model(seq_x, phys_feat=phys_feat, return_feat=True)
+            else:
+                pred = self.model(seq_x, phys_feat=phys_feat)
+                features = None
         else:
-            pred = self.model(seq_x)
+            if self.use_supcr:
+                pred, features = self.model(seq_x, return_feat=True)
+            else:
+                pred = self.model(seq_x)
+                features = None
 
-        loss = self.criterion(pred, seq_y)
-        return loss, pred, seq_y
+        # 计算各个 Loss
+        loss_mse = self.criterion_mse(pred, seq_y, weights)  # 加权 MSE
+        
+        loss_rank = 0
+        if self.lambda_rank > 0:
+            loss_rank = self.criterion_rank(pred, seq_y)
+
+        loss_sup = 0
+        if self.use_supcr and features is not None:
+            loss_sup = self.criterion_sup(features, seq_y)
+            
+        # 组合 Loss
+        total_loss = loss_mse + self.lambda_rank * loss_rank + self.lambda_sup * loss_sup
+        
+        return total_loss, pred, seq_y
 
 
     ####################
@@ -252,9 +309,9 @@ class Solver:
 
             self.model.train()
             train_loss = []
-            for (seq_x, seq_y) in tqdm(self.train_loader):
+            for (seq_x, seq_y, weights) in tqdm(self.train_loader):  # 接收 3 个值
                 self.optimizer.zero_grad()
-                loss, _, _ = self._process_batch(seq_x, seq_y)
+                loss, _, _ = self._process_batch(seq_x, seq_y, weights)  # 传入 weights
                 train_loss.append(loss.item())
                 loss.backward()
                 self.optimizer.step()
@@ -263,8 +320,8 @@ class Solver:
                 self.model.eval()
                 valid_loss = []
                 pred_list, true_list = [], []
-                for (seq_x, seq_y) in tqdm(self.valid_loader):
-                    loss, pred, target = self._process_batch(seq_x, seq_y)
+                for (seq_x, seq_y, weights) in tqdm(self.valid_loader):  # 接收 3 个值
+                    loss, pred, target = self._process_batch(seq_x, seq_y, weights)
                     valid_loss.append(loss.item())
                     true_list.append(target.detach().cpu())
                     pred_list.append(pred.detach().cpu())
@@ -320,8 +377,8 @@ class Solver:
             self.model.eval()
             test_loss = []
             pred_list, true_list = [], []
-            for (seq_x, seq_y) in tqdm(self.test_loader):
-                loss, pred, target = self._process_batch(seq_x, seq_y)
+            for (seq_x, seq_y, weights) in tqdm(self.test_loader):  # 接收 3 个值
+                loss, pred, target = self._process_batch(seq_x, seq_y, weights)
                 test_loss.append(loss.item())
                 pred_list.append(pred.detach().cpu())
                 true_list.append(target.detach().cpu())

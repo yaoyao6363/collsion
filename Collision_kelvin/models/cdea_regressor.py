@@ -240,8 +240,19 @@ class CDEARegressor(nn.Module):
         seq_x: torch.Tensor,                    # (B, seq_len, channel)
         phys_feat: Optional[torch.Tensor] = None,
         neighbor_mask: Optional[torch.Tensor] = None,
+        return_feat: bool = False,              # 是否返回特征向量（用于 SupCR）
     ) -> torch.Tensor:
-
+        """
+        Args:
+            seq_x: 输入序列 (B, seq_len, channel)
+            phys_feat: 物理特征 (B, P)，可选
+            neighbor_mask: 邻域mask (B, B)，可选
+            return_feat: 是否返回特征向量（用于 SupCR）
+        
+        Returns:
+            y_pred: 预测值 (B, 1)
+            feat: 特征向量 (B, d_model)，仅当 return_feat=True 时返回
+        """
         B, T, C = seq_x.shape
         assert T == self.seq_len, f"CDEARegressor: seq_len mismatch, got {T}, expect {self.seq_len}"
         assert C == self.channel, f"CDEARegressor: channel mismatch, got {C}, expect {self.channel}"
@@ -253,9 +264,13 @@ class CDEARegressor(nn.Module):
         for blk in self.blocks:
             h = blk(h, phys_feat=phys_feat, neighbor_mask=neighbor_mask)   # (B, T, d_model)
 
-        # 3) 事件级聚合: 在时间轴 T 上求平均 (也可以改成 last token / attention-pooling)
-        h_event = h.mean(dim=1)       # (B, d_model)
+        # 3) 事件级聚合: 在时间轴 T 上求平均（这是特征向量）
+        feat = h.mean(dim=1)       # (B, d_model)
 
         # 4) 回归头
-        y_pred = self.reg_head(h_event)   # (B, 1)
+        y_pred = self.reg_head(feat)   # (B, 1)
+        
+        # 根据参数返回
+        if return_feat:
+            return y_pred, feat
         return y_pred

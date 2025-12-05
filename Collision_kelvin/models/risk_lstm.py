@@ -20,9 +20,26 @@ class RiskLSTM(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(hidden_size, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_feat=False) -> torch.Tensor:
+        """
+        Args:
+            x: 输入序列 (B, seq_len, input_size)
+            return_feat: 是否返回特征向量（用于 SupCR）
+        
+        Returns:
+            pred: 预测值 (B, 1)
+            feat: 特征向量 (B, hidden_size)，仅当 return_feat=True 时返回
+        """
         out, _ = self.lstm(x)
-        out = self.dropout(out[:, -1, :])
-        pred = self.head(out)
+        
+        # 提取特征 (Embedding)
+        # out[:, -1, :] 是最后一个时间步的隐藏状态，作为样本的高维特征表示
+        feat = self.dropout(out[:, -1, :])
+        
+        pred = self.head(feat)
+        
+        # 根据参数返回
+        if return_feat:
+            return pred, feat
         return pred
 

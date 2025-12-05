@@ -11,7 +11,7 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser()
 
         """ 运行参数 """
-        parser.add_argument('--model', type=str, default='BAYES_LSTM', help='backbone network',
+        parser.add_argument('--model', type=str, default='LSTM', help='backbone network',
                             choices=['LSTM', 'TRANSFORMER','CDEA', 'BAYES_LSTM'])
         parser.add_argument('--only_test', default=False, action='store_true', help='only test the model')
 
@@ -26,9 +26,9 @@ if __name__ == '__main__':
                             help='number of latest CDMs to keep per event for sequence construction')
 
         """ LSTM模型超参 """
-        parser.add_argument('--hidden_size', type=int, default=128, help='hidden units for LSTM backbone')
-        parser.add_argument('--num_layers', type=int, default=5, help='LSTM layer count')
-        parser.add_argument('--dropout', type=float, default=0.2, help='dropout rate for LSTM')
+        parser.add_argument('--hidden_size', type=int, default=80, help='hidden units for LSTM backbone')
+        parser.add_argument('--num_layers', type=int, default=3, help='LSTM layer count')
+        parser.add_argument('--dropout', type=float, default=0.5, help='dropout rate for LSTM')
 
         """Transformer 超参"""
         parser.add_argument('--d_model', type=int, default=128, help='Transformer embedding dim')
@@ -48,11 +48,26 @@ if __name__ == '__main__':
         parser.add_argument('--bayes_num_layers', type=int, default=2, help='Bayes LSTM layer count')
         parser.add_argument('--bayes_dropout', type=float, default=0.2, help='dropout rate for Bayes LSTM')
         
+        """ 新增损失函数参数 """
+        parser.add_argument('--lambda_rank', type=float, default=0.1, 
+                            help='weight for RankLoss (0.0 to disable, recommended: 0.1)')
+        parser.add_argument('--rank_margin', type=float, default=0.0, 
+                            help='margin for RankLoss (usually 0.0 is fine)')
+        
+        parser.add_argument('--use_supcr', action='store_true', default=False, 
+                            help='whether to use SupConRegressionLoss (requires model to support return_feat)')
+        parser.add_argument('--lambda_sup', type=float, default=0.0, 
+                            help='weight for SupConRegressionLoss (0.0 to disable, recommended: 0.5)')
+        parser.add_argument('--sup_temp', type=float, default=0.1, 
+                            help='temperature for SupConRegressionLoss (lower = harder contrast)')
+        parser.add_argument('--sup_sigma', type=float, default=2.0, 
+                            help='sigma for SupConRegressionLoss label similarity (adjust based on label range)')
+        
         """ 优化参数 """
-        parser.add_argument('--itr', type=int, default=3, help='number of iterations')  ########## 运行次数
+        parser.add_argument('--itr', type=int, default=1, help='number of iterations')  ########## 运行次数
         parser.add_argument('--epoch', type=int, default=200, help='number of epochs')
-        parser.add_argument('--patience', type=int, default=5, help='patience for early stopping')
-        parser.add_argument('--batch_size', type=int, default=128, help='batch size')
+        parser.add_argument('--patience', type=int, default=10, help='patience for early stopping')
+        parser.add_argument('--batch_size', type=int, default=64, help='batch size')
         parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
 
         """ GPU 参数 """

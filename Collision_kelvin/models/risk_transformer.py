@@ -69,9 +69,15 @@ class RiskTransformer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(d_model, 1)  # 回归到 1 维
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_feat=False) -> torch.Tensor:
         """
-        x: (B, T, input_size)  —— 和 RiskLSTM 完全一致
+        Args:
+            x: 输入序列 (B, T, input_size)
+            return_feat: 是否返回特征向量（用于 SupCR）
+        
+        Returns:
+            pred: 预测值 (B, 1)
+            feat: 特征向量 (B, d_model)，仅当 return_feat=True 时返回
         """
         # 1) 线性投影到 d_model
         x = self.input_proj(x)      # (B, T, d_model)
@@ -82,10 +88,14 @@ class RiskTransformer(nn.Module):
         # 3) 过 TransformerEncoder
         x = self.encoder(x)         # (B, T, d_model)
 
-        # 4) 取最后一个时间步的特征（和你现在 LSTM 用最后隐状态的逻辑对应）
-        last = x[:, -1, :]          # (B, d_model)
-        last = self.dropout(last)
+        # 4) 取最后一个时间步的特征（作为样本的高维特征表示）
+        feat = x[:, -1, :]          # (B, d_model)
+        feat = self.dropout(feat)
 
         # 5) 回归头
-        pred = self.head(last)      # (B, 1)
+        pred = self.head(feat)      # (B, 1)
+        
+        # 根据参数返回
+        if return_feat:
+            return pred, feat
         return pred
