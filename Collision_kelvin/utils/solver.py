@@ -23,10 +23,11 @@ from utils.loss import calculate_lds_weights, WeightedMSELoss, RankLoss, SupConR
 class RegressionSequenceDataset(Dataset):
     """封装后的时序数据集，返回 (seq, target, weight)"""
 
-    def __init__(self, data: np.ndarray, targets: np.ndarray, weights: np.ndarray = None):
+    def __init__(self, data: np.ndarray, targets: np.ndarray, weights: np.ndarray = None, augment=False):
         targets = targets.reshape(-1, 1).astype(np.float32)
         self.data = torch.tensor(data, dtype=torch.float32)
         self.targets = torch.tensor(targets, dtype=torch.float32)
+        self.augment = augment  # 新增：数据增强开关
         
         # 处理权重：如果没有传权重(如测试集)，则全部设为 1.0
         if weights is None:
@@ -39,7 +40,17 @@ class RegressionSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         # 返回三个值: data, target, weight
-        return self.data[idx], self.targets[idx], self.weights[idx]
+        x = self.data[idx]
+        y = self.targets[idx]
+        w = self.weights[idx]
+        
+        # === 核心修改：训练时注入随机噪声 ===
+        if self.augment:
+            # 数据已经标准化 (std=1)，0.02 的噪声是合理的抖动
+            noise = torch.randn_like(x) * 0.02
+            x = x + noise
+        
+        return x, y, w
 
 
 def compute_metrics(preds, targets, threshold=-6):
@@ -149,7 +160,7 @@ class Solver:
         param_size_mb = param_size_bytes / (1024 ** 2)  # 转换为 MB
         print(f"Total trainable parameters: {total_params:,}, Size: {param_size_mb:.2f} MB")
 
-        self.optimizer = Adam(self.model.parameters(), lr=self.args.lr, weight_decay=1e-4)
+        self.optimizer = Adam(self.model.parameters(), lr=self.args.lr, weight_decay=1e-3)  # 增大 weight_decay 10倍
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=3)
         self.stopper = Stopper(patience=self.args.patience, path=self.model_path + '/' + 'checkpoint.pth')
         
@@ -235,10 +246,10 @@ class Solver:
         x_train, normalized_others = self._normalize_sequences(x_train, [x_val, test_x_r])
         x_val, x_test = normalized_others
 
-        # === [修改] 传入 weights ===
-        train_dataset = RegressionSequenceDataset(x_train, y_train, weights=train_weights_n)
-        val_dataset = RegressionSequenceDataset(x_val, y_val, weights=None)      # 验证集不加权
-        test_dataset = RegressionSequenceDataset(x_test, test_y_r, weights=None) # 测试集不加权
+        # === [修改] 传入 weights 和 augment ===
+        train_dataset = RegressionSequenceDataset(x_train, y_train, weights=train_weights_n, augment=True)  # 训练集开启增强
+        val_dataset = RegressionSequenceDataset(x_val, y_val, weights=None, augment=False)      # 验证集不加权，不增强
+        test_dataset = RegressionSequenceDataset(x_test, test_y_r, weights=None, augment=False) # 测试集不加权，不增强
 
         train_loader = DataLoader(train_dataset, batch_size=self.args.batch_size, shuffle=True, drop_last=False)
         val_loader = DataLoader(val_dataset, batch_size=self.args.batch_size, shuffle=False, drop_last=False)
@@ -261,7 +272,18 @@ class Solver:
         seq_y = seq_y.float().to(self.device)
         weights = weights.float().to(self.device)  # 移动权重到 GPU
 
+        # === 多任务学习：分离 Risk 和 Miss Distance ===
+        # seq_y: (B, 2) -> [risk, miss_distance]
+        if seq_y.dim() == 2 and seq_y.shape[1] == 2:
+            true_risk = seq_y[:, 0:1]  # (B, 1)
+            true_dist = seq_y[:, 1:2]  # (B, 1)
+        else:
+            # 兼容旧版本（只有 risk）
+            true_risk = seq_y
+            true_dist = None
+
         # 获取预测值和特征 (SupCR 需要特征)
+        pred_dist = None  # 初始化
         if self.args.model == 'CDEA':
             # seq_x: (B, seq_len, feature_dim)
             # 取最后一个时间步的特征作为"当前 TCA 前刻"的物理状态
@@ -277,24 +299,37 @@ class Solver:
             if self.use_supcr:
                 pred, features = self.model(seq_x, return_feat=True)
             else:
-                pred = self.model(seq_x)
+                model_output = self.model(seq_x)
+                # === 处理多任务输出 ===
+                if isinstance(model_output, tuple) and len(model_output) == 2:
+                    pred, pred_dist = model_output  # Transformer 训练时返回两个值
+                else:
+                    pred = model_output
                 features = None
 
         # 计算各个 Loss
-        loss_mse = self.criterion_mse(pred, seq_y, weights)  # 加权 MSE
+        # 1. Risk Loss (带 LDS 权重)
+        loss_mse = self.criterion_mse(pred, true_risk, weights)  # 加权 MSE
         
+        # 2. Physics Loss (预测距离的误差，不用加权)
+        loss_dist = 0
+        if pred_dist is not None and true_dist is not None:
+            loss_dist = torch.nn.functional.mse_loss(pred_dist, true_dist)
+        
+        # 3. RankLoss
         loss_rank = 0
         if self.lambda_rank > 0:
-            loss_rank = self.criterion_rank(pred, seq_y)
+            loss_rank = self.criterion_rank(pred, true_risk)
 
+        # 4. SupCR Loss
         loss_sup = 0
         if self.use_supcr and features is not None:
-            loss_sup = self.criterion_sup(features, seq_y)
+            loss_sup = self.criterion_sup(features, true_risk)
             
-        # 组合 Loss
-        total_loss = loss_mse + self.lambda_rank * loss_rank + self.lambda_sup * loss_sup
+        # 组合 Loss (0.1 是物理约束的权重)
+        total_loss = loss_mse + self.lambda_rank * loss_rank + self.lambda_sup * loss_sup + 0.1 * loss_dist
         
-        return total_loss, pred, seq_y
+        return total_loss, pred, true_risk
 
 
     ####################

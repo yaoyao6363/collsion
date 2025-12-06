@@ -192,6 +192,8 @@ class CreateDataset:
 
         calssification_output = DataUtils.output_features.index('risk_category')
         regression_output = DataUtils.output_features.index('risk')
+        # === 新增：获取 miss_distance 的索引 ===
+        miss_distance_output = DataUtils.output_features.index('miss_distance')
 
         train_x, train_y = self.split_input_output_seq(train_data)
         test_x, test_y = self.split_input_output_seq(test_data)
@@ -207,10 +209,13 @@ class CreateDataset:
         train_x_r = np.array(
             [DataUtils.pad_matrix(train[:, regression_features], self.n_latest_cdms - 1).ravel() for train in
              train_x], dtype=np.float32)
+        # === 暂时禁用多任务学习，只返回 risk ===
         train_y_r = np.array([train[:, regression_output].ravel() for train in train_y]).reshape(-1).astype(np.float32)
+        
         test_x_r = np.array(
             [DataUtils.pad_matrix(test[:, regression_features], self.n_latest_cdms - 1).ravel() for test in test_x],
             dtype=np.float32)
+        # === 暂时禁用多任务学习，只返回 risk ===
         test_y_r = np.array([test[:, regression_output].ravel() for test in test_y]).reshape(-1).astype(np.float32)
 
         classifcation_dataset = (train_x_c, train_y_c, test_x_c, test_y_c)

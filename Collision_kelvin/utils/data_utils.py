@@ -56,7 +56,7 @@ class DataUtils:
        't_position_covariance_det', 'c_position_covariance_det', 't_sigma_r',
        't_sigma_t', 't_sigma_n', 'risk_range', 'risk_category']
     
-    output_features = ['risk', 'risk_category', 'event_id']
+    output_features = ['risk', 'risk_category', 'event_id', 'miss_distance']
     
     @staticmethod
     def process_string(df: pd.DataFrame) -> pd.DataFrame:
